@@ -6,7 +6,9 @@ from enum import Enum
 from random import random
 from threading import Lock, Thread
 from time import sleep
-from typing import Optional, List, Dict, Callable, Set
+from typing import Optional, List, Dict, Callable, Set, Iterable
+
+from collections import Counter
 
 import rpyc
 from rpyc import ThreadedServer, Service
@@ -25,18 +27,16 @@ class Order(str, Enum):
 
 
 class Actions(str, Enum):
-    receive_order = "receive_order"
-    receive_primary = "reveive_primary"
-    receive_new_node = "reveive_new_node"
-
+    order = "order"
+    client_order = "client_order"
+    response = "response"
 
 
 @dataclass(frozen=True)
 class Message:
     sender: str
     action: str
-    value: Optional[str]
-    time: int
+    value: Optional[str] = None
 
     def serialize(self) -> str:
         return json.dumps(asdict(self))
@@ -46,81 +46,137 @@ class Message:
         return cls(**json.loads(serialized))
 
 
-class GeneralLogic:
-    def __init__(self, id: str):
+def majority(received_values: Iterable) -> Optional[str]:
+    top2 = Counter(received_values).most_common(2)
+
+    if len(top2) == 0 or len(top2) > 1 and top2[0][1] == top2[1][1]:
+        return None
+
+    return top2[0][0]
+
+
+class General(Thread):
+    def __init__(self, id: str, id_to_port: Dict[str, int],
+                 primary_id: Optional[str] = None):
+        super().__init__()
         self.id = id
-        self.state: State = State.nonfaulty
-
-        self.received_values: Dict[str, Order] = {}
-
-        self.primary_id: Optional[str] = None
-
-        self.other_nodes: Set[str] = set()
-
-        self.order_in_progress = False
+        self.id_to_port = id_to_port
+        self.primary_id = primary_id
 
         self.communication_callback: Optional[Callable] = None
+        self.other_nodes: Set[str] = set(id_to_port.keys()) - {id}
+        self.received_values: Dict[str, str] = {}
+        self.state: State = State.nonfaulty
 
-    def _process_order(self, order: Order) -> str:
+        self.order_in_progress = False
+        self.connections = {}
+        self.lock = Lock()
+        self.ready = False
+        self.server = None
+
+    @property
+    def port(self):
+        return self.id_to_port[self.id]
+
+    def _process_order(self, order: str) -> str:
         if self.state == State.faulty:
             return Order.attack.value if random() < 0.5 else Order.retreat.value
-        return order.value
+        return order
 
-    def _send_order(self, order: Order):
-        for id in self.other_non_primary_nodes:
+    def _send_order(self, order: str):
+        for id in self.other_nodes - {self.primary_id}:
             self.communication_callback(id,
-                                        Message(self.id, Actions.receive_order.value, self._process_order(order), 0))
+                                        Message(self.id, Actions.order.value, self._process_order(order)))
 
-    @property
-    def other_non_primary_nodes(self):
-        return {node for node in self.other_nodes if node != self.primary_id}
+    def _handle_order(self, message: Message):
+        if message.sender == self.primary_id:
+            primary_order = message.value
+            self.received_values[message.sender] = primary_order
+            self._send_order(primary_order)
+        else:
+            self.received_values[message.sender] = message.value
 
-    @property
-    def majority(self) -> Order:
-        assert len(self.received_values) > 0
-        values = {}
-        for v in self.received_values.values():
-            values[v] = 0 if v not in values else values[v] + 1
-
-        top = tuple(reversed(sorted(values.items(), key=lambda x: x[1])))
-        if len(top) == 1:
-            return Order(top[0][0])
-
-        if top[0][1] == top[1][1]:
-            return Order.undecided
-
-    def receive_message(self, message: Message) -> Optional[Message]:
-        if message.action == Actions.receive_order:
-            print(self.id, "received", message.value, "from", message.sender)
-            if message.sender == self.primary_id:
-                primary_order = Order(message.value)
-                self.received_values[message.sender] = primary_order
-                self._send_order(primary_order)
+        if len(self.received_values) == len(self.other_nodes):
+            if self.id == self.primary_id:
+                self.order_in_progress = False
             else:
-                self.received_values[message.sender] = Order(message.value)
+                #print(self.id, "majority", majority(self.received_values.values()), self.received_values)
+                self.communication_callback(
+                    self.primary_id,
+                    Message(self.id, Actions.order.value, majority(self.received_values.values()))
+                )
+                self.received_values = {}
 
-            if len(self.received_values) == len(self.other_nodes):
-                if self.id == self.primary_id:
-                    self.order_in_progress = False
-                else:
-                    self.communication_callback(self.primary_id,
-                                                Message(self.id, Actions.receive_order.value, self.majority.value, 0))
+    def handle_message(self, message: Message) -> Optional[Message]:
+        #print(self.id, "received", message.value, "from", message.sender)
+        # wait for the node to be fully set up
+        while not self.ready:
+            sleep(0.1)
 
-        elif message.action == Actions.receive_primary:
-            self.primary_id = message.value
-        elif message.action == Actions.receive_new_node:
-            self.other_nodes.add(message.value)
+        if message.action == Actions.order:
+            with self.lock:
+                self._handle_order(message)
+
+        elif message.action == Actions.client_order:
+            order = message.value
+            self.order_in_progress = True
+            self._send_order(order)
+            while self.order_in_progress:
+                sleep(0.1)
+
+            majorities = {**self.received_values, self.id: order}
+            self.received_values = {}
+            return Message(self.id, Actions.response, json.dumps(majorities))
 
         return None
 
-    def send_order(self, order: Order):
-        assert self.id == self.primary_id
-        self.order_in_progress = True
-        self._send_order(order)
+    def _start_server(self):
+        service = classpartial(GeneralService, self.handle_message)
+        self.server = ThreadedServer(service, port=self.port)
+        thread = Thread(target=self.server.start)
+        thread.daemon = True
+        thread.start()
 
-        while self.order_in_progress:
-            pass
-        return self.majority, self.received_values.copy()
+    def _open_connections(self):
+        for id, port in self.id_to_port.items():
+            self.connections[id] = rpyc.connect("localhost", port)
+
+    def _send_message(self, id: str, message: Message):
+        reponse = self.connections[id].root.message(message.serialize())
+        if reponse is not None:
+            return Message.deserialize(reponse)
+        return None
+
+    def stop(self):
+        if id in self.connections:
+            self.connections[id].close()
+        self.server.close()
+
+
+    def add_node(self, id, port):
+        assert id != self.id
+        self.ready = False
+        self.id_to_port[id] = port
+        self.other_nodes.add(id)
+        self.connections[id] = rpyc.connect("localhost", port)
+        self.ready = True
+
+    def remove_node(self, id):
+        if id in self.connections:
+            self.connections[id].close()
+            del self.connections[id]
+        if id in self.other_nodes:
+            self.other_nodes.remove(id)
+        if id in self.id_to_port:
+            del self.id_to_port[id]
+        if id == self.primary_id:  # automatically appoint new primary id
+            self.primary_id = min(self.id_to_port.keys())
+
+    def run(self):
+        self._start_server()
+        self._open_connections()
+        self.communication_callback = self._send_message
+        self.ready = True
 
 
 class GeneralService(Service):
@@ -135,44 +191,3 @@ class GeneralService(Service):
             return None
         else:
             raise Exception("Invalid response type")
-
-
-class General(Thread):
-    def __init__(self, id, id_to_port):
-        super().__init__()
-        self.logic = GeneralLogic(id)
-        self.id_to_port = id_to_port
-        self.connections = {}
-        self.lock = Lock()
-
-    def add_node(self, id, port):
-        assert id != self.logic.id
-        self.id_to_port[id] = port
-        self.logic.other_nodes.add(id)
-        self.connections[id] = rpyc.connect("localhost", port)
-
-    def _callback(self, message: Message):
-        with self.lock:
-            self.logic.receive_message(message)
-
-    def _start_server(self):
-        service = classpartial(GeneralService, self._callback)
-        server = ThreadedServer(service, port=self.id_to_port[self.logic.id])
-        thread = Thread(target=server.start)
-        thread.daemon = True
-        thread.start()
-
-    def _open_connections(self):
-        for id, port in self.id_to_port.items():
-            self.connections[id] = rpyc.connect("localhost", port)
-
-    def _send_message(self, id, message):
-        return self.connections[id].root.message(message)
-
-    def run(self):
-        self._start_server()
-        self._open_connections()
-        self.logic.communication_callback = self._send_message
-
-    def send_order(self, order):
-        self.logic.send_order(order)

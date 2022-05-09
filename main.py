@@ -1,4 +1,6 @@
+import argparse
 import json
+import sys
 from itertools import count
 from typing import Optional, Dict
 
@@ -20,110 +22,146 @@ class Client:
         with rpyc.connect("localhost", self.primary_port) as conn:
             votes = json.loads(
                 Message.deserialize(
-                    conn.root.message(Message("client", Actions.client_order, order).serialize())
+                    conn.root.message(Message(client_id, Actions.client_order, order).serialize())
                 ).value
             )
+            votes = {int(k): v for k, v in votes.items()}
         decision = majority(votes.values())
         return decision, votes
 
 
-N = 3
-client_port = 10010
-process_ports = tuple(client_port + i + 1 for i in range(N))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Faulty General Detection')
+    parser.add_argument('n_procs', metavar='N', type=int, help="The number of processes to create.")
+    parser.add_argument('--starting-port', type=int, default=18812, help="First port of the processes.")
 
-ports = count(client_port + N + 1)
-ids = map(lambda x: f"G{x}",count(N))
+    args = parser.parse_args()
+    N = args.n_procs
+    starting_port = args.starting_port
+    client_id = 0  # reserved for client
 
-id_to_port = {f"G{i}": port for i, port in enumerate(process_ports)}
-primary_id = min(id_to_port)
+    process_ports = tuple(starting_port + i for i in range(N))
 
-generals = {}
-for id, port in id_to_port.items():
-    gen = General(id, id_to_port.copy(), primary_id)
-    gen.start()
-    generals[id] = gen
+    ports = count(starting_port + N + 1)
+    ids = count(N + 1)
 
-client = Client(primary_id, id_to_port[primary_id])
-faulty_nodes = set()
+    id_to_port = {i: port for i, port in enumerate(process_ports, start=1)}
+    primary_id = min(id_to_port)
+    client = Client(primary_id, id_to_port[primary_id])
 
+    generals = {}
+    for id, port in id_to_port.items():
+        gen = General(id, id_to_port.copy(), primary_id)
+        gen.start()
+        generals[id] = gen
 
-def remove_node(id: str, id_to_port: Dict[str, int]):
-    if id not in id_to_port:
-        print("A general with this id does not exist")
-        return
-
-    for _, general in generals.items():
-        general.remove_node(id)
-    generals[id].stop()
-
-    del generals[id]
-    del id_to_port[id]
-    faulty_nodes.remove(id)
-
-    if id == client.primary_id:
-        new_primary_id = min(generals)
-        client.set_primary(new_primary_id, id_to_port[new_primary_id])
+    faulty_nodes = set()
 
 
-def add_node(id_to_port):
-    port = next(ports)
-    id = next(ids)
+    def remove_node(id: int, id_to_port: Dict[int, int]):
+        if id not in id_to_port:
+            print("A general with this id does not exist")
+            return
 
-    id_to_port[id] = port
-    gen = General(id, id_to_port.copy(), primary_id)
-    gen.start()
+        if len(id_to_port) == 1:
+            print("Can't remove the requested node. The system must have at least 1 node.")
+            return
 
-    for general in generals.values():
-        general.add_node(id, port)
-    generals[id] = gen
+        for _, general in generals.items():
+            general.remove_node(id)
+        generals[id].stop()
 
+        del generals[id]
+        del id_to_port[id]
+        if id in faulty_nodes:
+            faulty_nodes.remove(id)
 
-def send_order(order):
-    print(client.send_order(order))
-
-
-def set_state(id, state):
-    if state == "Faulty":
-        faulty_nodes.add(id)
-        generals[id].state = State.faulty
-    if state == "Non-faulty":
-        faulty_nodes.remove(id)
-        generals[id].state = State.nonfaulty
+        if id == client.primary_id:
+            new_primary_id = min(generals)
+            client.set_primary(new_primary_id, id_to_port[new_primary_id])
 
 
-def show_majority(id, majority):
-    print(
-        f"{id} {'primary' if id == client.primary_id else 'secondary'} majority={majority.value} {'F' if id in faulty_nodes else 'NF'}")
+    def add_node(id_to_port: Dict[int, int]):
+        port = next(ports)
+        id = next(ids)
+
+        id_to_port[id] = port
+        gen = General(id, id_to_port.copy(), client.primary_id)
+        gen.start()
+
+        for general in generals.values():
+            general.add_node(id, port)
+        generals[id] = gen
 
 
-def show_state(id):
-    print(
-        f"{id} {'primary' if id == client.primary_id else 'secondary'} {'F' if id in faulty_nodes else 'NF'}")
+    def send_order(order):
+        actual_order, node_majorities = client.send_order(order)
+        if len(faulty_nodes) * 3 + 1 > len(generals):
+            print("Warning:  3k + 1 requirements for Byzantine Agreement not fulfilled.")
+        if actual_order is None:
+            print(f"Execute order: cannot be determined – not enough generals in the system! "
+                  f"{len(faulty_nodes)} faulty node(s) in the system - "
+                  f"{len(generals) // 2 + 1} out of {len(generals)} quorum not consistent")
+        else:
+            print(f"Execute order: {actual_order}! "
+                  f"{len(faulty_nodes)} faulty node(s) in the system – "
+                  f"{len(generals) // 2 + 1} out of {len(generals)} quorum suggest {actual_order}")
+        print_system(node_majorities)
 
 
-def print_system():
-    for id, general in sorted(generals.items()):
-        primary = 'primary' if general.id == general.primary_id else 'secondary'
-        print(general.id, general.state.value, primary)
+    def set_state(id: int, state: str):
+        if state == "Faulty":
+            faulty_nodes.add(id)
+            generals[id].state = State.faulty
+        elif state == "Non-faulty":
+            if id in faulty_nodes:
+                faulty_nodes.remove(id)
+            generals[id].state = State.nonfaulty
+        else:
+            print("Invalid state. The state must be either Faulty or Non-faulty (case-sensitive).")
 
 
-while True:
-    arguments = input("Input command: ").split(" ")
-    command = arguments[0]
+    def print_system(majority=None):
+        for id, general in sorted(generals.items()):
+            if majority is not None and id in majority:
+                majority_value = "undefined" if majority[id] is None else majority[id]
+                majority_text = f"majority={majority_value}"
+            else:
+                majority_text = ""
 
-    if len(arguments) > 3:
-        print("Too many arguments")
-    elif command == "actual-order":
-        send_order(Order(arguments[1]))
-    elif command == "g-kill":
-        remove_node(arguments[1], id_to_port)
-        print_system()
-    elif command == "g-add":
-        for _ in range(int(arguments[1])):
-            add_node(id_to_port)
-        print_system()
-    elif command == "g-state":
-        set_state(arguments[1], arguments[2])
-        print_system()
-    else:
-        print("Unknown command")
+            role_text = 'primary' if general.id == general.primary_id else 'secondary'
+            print(f"G{id} {role_text} {majority_text} state={general.state.value}")
+
+
+    def parse_id(s: str) -> int:
+        if s[0] != "G":
+            print("General id must start with G")
+
+        return int(s[1:])
+
+
+    while True:
+        command, *arguments = input("Input command: ").split(" ")
+
+        try:
+            if len(arguments) > 2:
+                print("Too many arguments")
+            elif command == "actual-order":
+                send_order(Order(arguments[0]))
+            elif command == "g-kill":
+                remove_node(parse_id(arguments[0]), id_to_port)
+                print_system()
+            elif command == "g-add":
+                for _ in range(int(arguments[0])):
+                    add_node(id_to_port)
+                print_system()
+            elif command == "g-state":
+                if len(arguments) > 0:
+                    set_state(parse_id(arguments[0]), arguments[1])
+                print_system()
+            elif command == "exit":
+                sys.exit(1)
+            else:
+                print("Unknown command")
+        except Exception as e:
+            print(e)

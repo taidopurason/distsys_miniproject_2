@@ -16,8 +16,8 @@ from rpyc.utils.helpers import classpartial
 
 
 class State(str, Enum):
-    faulty = "faulty"
-    nonfaulty = "nonfaulty"
+    faulty = "F"
+    nonfaulty = "NF"
 
 
 class Order(str, Enum):
@@ -34,7 +34,7 @@ class Actions(str, Enum):
 
 @dataclass(frozen=True)
 class Message:
-    sender: str
+    sender: int
     action: str
     value: Optional[str] = None
 
@@ -56,16 +56,15 @@ def majority(received_values: Iterable) -> Optional[str]:
 
 
 class General(Thread):
-    def __init__(self, id: str, id_to_port: Dict[str, int],
-                 primary_id: Optional[str] = None):
+    def __init__(self, id: int, id_to_port: Dict[int, int],
+                 primary_id: Optional[int] = None):
         super().__init__()
         self.id = id
         self.id_to_port = id_to_port
         self.primary_id = primary_id
 
         self.communication_callback: Optional[Callable] = None
-        self.other_nodes: Set[str] = set(id_to_port.keys()) - {id}
-        self.received_values: Dict[str, str] = {}
+        self.received_values: Dict[int, str] = {}
         self.state: State = State.nonfaulty
 
         self.order_in_progress = False
@@ -75,7 +74,11 @@ class General(Thread):
         self.server = None
 
     @property
-    def port(self):
+    def other_nodes(self) -> Set[int]:
+        return set(self.id_to_port.keys()) - {self.id}
+
+    @property
+    def port(self) -> int:
         return self.id_to_port[self.id]
 
     def _process_order(self, order: str) -> str:
@@ -84,9 +87,12 @@ class General(Thread):
         return order
 
     def _send_order(self, order: str):
-        for id in self.other_nodes - {self.primary_id}:
+        non_primary_other_nodes = self.other_nodes - {self.primary_id}
+        for id in non_primary_other_nodes:
             self.communication_callback(id,
                                         Message(self.id, Actions.order.value, self._process_order(order)))
+        if len(non_primary_other_nodes) == 0:
+            self.order_in_progress = False
 
     def _handle_order(self, message: Message):
         if message.sender == self.primary_id:
@@ -100,7 +106,6 @@ class General(Thread):
             if self.id == self.primary_id:
                 self.order_in_progress = False
             else:
-                #print(self.id, "majority", majority(self.received_values.values()), self.received_values)
                 self.communication_callback(
                     self.primary_id,
                     Message(self.id, Actions.order.value, majority(self.received_values.values()))
@@ -108,7 +113,6 @@ class General(Thread):
                 self.received_values = {}
 
     def handle_message(self, message: Message) -> Optional[Message]:
-        #print(self.id, "received", message.value, "from", message.sender)
         # wait for the node to be fully set up
         while not self.ready:
             sleep(0.1)
@@ -157,7 +161,6 @@ class General(Thread):
         assert id != self.id
         self.ready = False
         self.id_to_port[id] = port
-        self.other_nodes.add(id)
         self.connections[id] = rpyc.connect("localhost", port)
         self.ready = True
 
@@ -165,8 +168,6 @@ class General(Thread):
         if id in self.connections:
             self.connections[id].close()
             del self.connections[id]
-        if id in self.other_nodes:
-            self.other_nodes.remove(id)
         if id in self.id_to_port:
             del self.id_to_port[id]
         if id == self.primary_id:  # automatically appoint new primary id

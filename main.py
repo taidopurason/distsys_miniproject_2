@@ -39,6 +39,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     N = args.n_procs
+    if N < 1:
+        raise Exception("N must be greater than 0")
+
     starting_port = args.starting_port
     client_id = 0  # reserved for client
 
@@ -99,7 +102,7 @@ if __name__ == "__main__":
     def send_order(order):
         actual_order, node_majorities = client.send_order(order)
         if len(faulty_nodes) * 3 + 1 > len(generals):
-            print("Warning:  3k + 1 requirements for Byzantine Agreement not fulfilled.")
+            print("Warning:  3k + 1 requirement for Byzantine Agreement not fulfilled.")
         if actual_order is None:
             print(f"Execute order: cannot be determined – not enough generals in the system! "
                   f"{len(faulty_nodes)} faulty node(s) in the system - "

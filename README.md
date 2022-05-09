@@ -32,6 +32,11 @@ python main.py 3 --starting-port 10010
 When started, the program asks for user input. 
 Valid user inputs are as in the instructions (see *Mini-project2-DS2022.pdf*).
 
+## Demo video
+
+https://user-images.githubusercontent.com/42523949/167486568-4366a587-30a0-4481-927f-6afba450792f.mp4
+
+
 
 
 

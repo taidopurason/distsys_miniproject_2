@@ -129,6 +129,8 @@ class General(Thread):
                 sleep(0.1)
 
             majorities = {**self.received_values, self.id: order}
+            # the final decision with reserved id 0
+            majorities[0] = majority(majorities.values())
             self.received_values = {}
             return Message(self.id, Actions.response, json.dumps(majorities))
 

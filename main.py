@@ -6,7 +6,7 @@ from typing import Optional, Dict
 
 import rpyc
 
-from general import Order, Message, General, Actions, majority, State
+from general import Order, Message, General, Actions, State
 
 
 class Client:
@@ -26,7 +26,9 @@ class Client:
                 ).value
             )
             votes = {int(k): v for k, v in votes.items()}
-        decision = majority(votes.values())
+        decision = votes[0]
+        del votes[0]
+
         return decision, votes
 
 
@@ -125,17 +127,17 @@ if __name__ == "__main__":
         for id, general in sorted(generals.items()):
             if majority is not None and id in majority:
                 majority_value = "undefined" if majority[id] is None else majority[id]
-                majority_text = f"majority={majority_value}"
+                majority_text = f" majority={majority_value},"
             else:
                 majority_text = ""
 
             role_text = 'primary' if general.id == general.primary_id else 'secondary'
-            print(f"G{id} {role_text} {majority_text} state={general.state.value}")
+            print(f"G{id}, {role_text},{majority_text} state={general.state.value}")
 
 
     def parse_id(s: str) -> int:
         if s[0] != "G":
-            print("General id must start with G")
+            raise Exception("General id must start with G")
 
         return int(s[1:])
 
@@ -160,7 +162,7 @@ if __name__ == "__main__":
                     set_state(parse_id(arguments[0]), arguments[1])
                 print_system()
             elif command == "exit":
-                sys.exit(1)
+                sys.exit(0)
             else:
                 print("Unknown command")
         except Exception as e:

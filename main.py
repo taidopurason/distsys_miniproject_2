@@ -135,12 +135,6 @@ if __name__ == "__main__":
             print(f"G{id}, {role_text},{majority_text} state={general.state.value}")
 
 
-    def parse_id(s: str) -> int:
-        if s[0] != "G":
-            raise Exception("General id must start with G")
-
-        return int(s[1:])
-
 
     while True:
         command, *arguments = input("Input command: ").split(" ")
@@ -151,7 +145,7 @@ if __name__ == "__main__":
             elif command == "actual-order":
                 send_order(Order(arguments[0]))
             elif command == "g-kill":
-                remove_node(parse_id(arguments[0]), id_to_port)
+                remove_node(int(arguments[0]), id_to_port)
                 print_system()
             elif command == "g-add":
                 for _ in range(int(arguments[0])):
@@ -159,7 +153,7 @@ if __name__ == "__main__":
                 print_system()
             elif command == "g-state":
                 if len(arguments) > 0:
-                    set_state(parse_id(arguments[0]), arguments[1])
+                    set_state(int(arguments[0]), arguments[1])
                 print_system()
             elif command == "exit":
                 sys.exit(0)
